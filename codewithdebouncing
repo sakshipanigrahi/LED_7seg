@@ -1,0 +1,436 @@
+#include <stdint.h>
+#include "inc/tm4c123gh6pm.h"
+
+/* ============================================================
+   PORT B -> SEGMENT MAPPING  (common cathode: 1 = segment ON)
+   PB0 = a  0x01      PB4 = e  0x10
+   PB1 = b  0x02      PB5 = f  0x20
+   PB2 = c  0x04      PB6 = g  0x40
+   PB3 = d  0x08      PB7 = dp 0x80
+
+   PORT A -> MODULE (DIGIT POSITION) MAPPING
+   PA7 = 0x80 -> Module 1 (leftmost)  -> STATUS  'r' or 'P'
+   PA6 = 0x40 -> Module 2             -> COLOUR number
+   PA5 = 0x20 -> Module 3             -> letter 'S'
+   PA4 = 0x10 -> Module 4 (rightmost) -> RATE number
+
+   PORT F
+   PF1 red, PF2 blue, PF3 green (outputs)
+   PF4 = SW1 (input, pull-up)   PF0 = SW2 (input, pull-up)
+   ============================================================ */
+
+#define SEG_0   0x3F
+#define SEG_1   0x06
+#define SEG_2   0x5B
+#define SEG_3   0x4F
+#define SEG_4   0x66
+#define SEG_5   0x6D
+#define SEG_6   0x7D
+#define SEG_7   0x07
+#define SEG_8   0x7F
+#define SEG_S   0x6D
+#define SEG_r   0x31      /* segments a + e + f  -> r (running) */
+#define SEG_P   0x73      /* segments a+b+e+f+g  -> capital P  (paused)  */
+
+#define TICK        3180  /* inner loop count that gives about 1 ms */
+#define WAIT_MS     50    /* how long to wait for the second switch */
+#define DEBOUNCE_MS 5      /* how many consecutive stable ticks before a pin reading is trusted */
+
+int colourDigits[8] = {SEG_1, SEG_2, SEG_3, SEG_4, SEG_5, SEG_6, SEG_7, SEG_8};
+int rateDigits[8]   = {SEG_1, SEG_2, SEG_3, SEG_4, SEG_5, SEG_6, SEG_7, SEG_8};
+
+void ShowDigit(int colorIndex, int rateIndex, int paused)
+{
+    static int turn = 0;
+
+    GPIO_PORTA_DATA_R &= ~0xF0;      /* blank all four modules first */
+
+    if (turn == 0)
+    {
+        GPIO_PORTB_DATA_R = colourDigits[colorIndex];
+        GPIO_PORTA_DATA_R |= 0x40;   /* PA6 -> Module 2 */
+    }
+    if (turn == 1)
+    {
+        GPIO_PORTB_DATA_R = SEG_S;
+        GPIO_PORTA_DATA_R |= 0x20;   /* PA5 -> Module 3 */
+    }
+    if (turn == 2)
+    {
+        GPIO_PORTB_DATA_R = rateDigits[rateIndex];
+        GPIO_PORTA_DATA_R |= 0x10;   /* PA4 -> Module 4 */
+    }
+    if (turn == 3)
+    {
+        if (paused == 1)
+        {
+            GPIO_PORTB_DATA_R = SEG_P;
+        }
+        else
+        {
+            GPIO_PORTB_DATA_R = SEG_r;
+        }
+        GPIO_PORTA_DATA_R |= 0x80;   /* PA7 -> Module 1 */
+    }
+
+    turn = turn + 1;
+    if (turn == 4)
+    {
+        turn = 0;
+    }
+}
+
+int main(void)
+{
+    int colors[8] = {0x02, 0x08, 0x04, 0x0E, 0x06, 0x0A, 0x0C, 0x00};
+    int rates[8]  = {2500, 2000, 1500, 1250, 1000, 500, 250, 100};
+    int colorIndex = 0;
+    int rateIndex = 0;
+    int sw1 = 1;
+    int sw2 = 1;
+    int s1now, s2now;
+    int paused = 0;
+    int waiting = 0;               /* 0 = nothing pending, 1 = SW1, 2 = SW2 */
+    int waitCount = 0;             /* ticks counted since the note was made */
+    int i, j;
+    int delayLimit;
+
+    /* ---- debounce state: raw pin history + how long it has held steady ---- */
+    int r1, r2;                    /* raw pin reading taken this tick */
+    int raw1 = 1, raw2 = 1;        /* last raw reading seen (for spotting a change) */
+    int stable1 = 1, stable2 = 1;  /* the trusted, debounced reading -- this is what the rest of the program uses */
+    int db1Count = 0, db2Count = 0;/* how many ticks in a row the raw reading has been unchanged */
+
+    /* ---- clocks: bit0 = Port A, bit1 = Port B, bit5 = Port F ---- */
+    SYSCTL_RCGC2_R |= 0x00000023;
+    for (j = 0; j < 10; j++);          /* let the clock settle */
+
+    /* ---- Port F: LED + switches ---- */
+    GPIO_PORTF_LOCK_R = 0x4C4F434B;
+    GPIO_PORTF_CR_R = 0x01;
+    GPIO_PORTF_DIR_R = 0x0E;
+    GPIO_PORTF_PUR_R = 0x11;
+    GPIO_PORTF_DEN_R = 0x1F;
+
+    /* ---- Port A: PA4, PA5, PA6, PA7 drive the four modules ---- */
+    GPIO_PORTA_DIR_R |= 0xF0;
+    GPIO_PORTA_DEN_R |= 0xF0;
+
+    /* ---- Port B: PB0..PB7 drive the eight segments ---- */
+    GPIO_PORTB_DIR_R = 0xFF;
+    GPIO_PORTB_DEN_R = 0xFF;
+
+    while (1)
+    {
+        /* ================= LED ON HALF ================= */
+        GPIO_PORTF_DATA_R = colors[colorIndex];
+        delayLimit = rates[rateIndex];
+        for (i = 0; i < delayLimit; i++)
+        {
+            /* ---- DEBOUNCE FILTER ----
+               Take the raw reading. If it matches last tick's raw reading,
+               count one more tick of "held steady". Only once it has held
+               steady for DEBOUNCE_MS ticks in a row do we accept it into
+               stable1/stable2 -- that is what the rest of the program reads. */
+            r1 = GPIO_PORTF_DATA_R & 0x10;
+            r2 = GPIO_PORTF_DATA_R & 0x01;
+
+            if (r1 == raw1)
+            {
+                if (db1Count < DEBOUNCE_MS)
+                {
+                    db1Count = db1Count + 1;
+                }
+            }
+            else
+            {
+                raw1 = r1;          /* pin moved -- start counting again from this new value */
+                db1Count = 0;
+            }
+            if (db1Count == DEBOUNCE_MS)
+            {
+                stable1 = raw1;
+            }
+
+            if (r2 == raw2)
+            {
+                if (db2Count < DEBOUNCE_MS)
+                {
+                    db2Count = db2Count + 1;
+                }
+            }
+            else
+            {
+                raw2 = r2;
+                db2Count = 0;
+            }
+            if (db2Count == DEBOUNCE_MS)
+            {
+                stable2 = raw2;
+            }
+
+            s1now = stable1;
+            s2now = stable2;
+            /* ---- END DEBOUNCE FILTER ---- */
+
+            if (s1now == 0 && s2now == 0 && (sw1 != 0 || sw2 != 0))
+            {
+                waiting = 0;                 /* cancel any pending action */
+                if (paused == 0)
+                {
+                    paused = 1;
+                }
+                else
+                {
+                    paused = 0;
+                }
+            }
+            else if (s1now == 0 && sw1 != 0 && paused == 0)
+            {
+                waiting = 1;                 /* note it, do not act yet */
+                waitCount = 0;
+            }
+            else if (s2now == 0 && sw2 != 0 && paused == 0)
+            {
+                waiting = 2;
+                waitCount = 0;
+            }
+
+            if (waiting != 0)
+            {
+                waitCount = waitCount + 1;
+                if (waitCount == WAIT_MS)    /* partner never arrived */
+                {
+                    if (waiting == 1)
+                    {
+                        rateIndex = rateIndex + 1;
+                        if (rateIndex == 8)
+                        {
+                            rateIndex = 0;
+                        }
+                    }
+                    else
+                    {
+                        colorIndex = colorIndex + 1;
+                        if (colorIndex == 8)
+                        {
+                            colorIndex = 0;
+                        }
+                    }
+                    waiting = 0;
+                }
+            }
+
+            sw1 = s1now;
+            sw2 = s2now;
+
+            while (paused == 1)
+            {
+                r1 = GPIO_PORTF_DATA_R & 0x10;
+                r2 = GPIO_PORTF_DATA_R & 0x01;
+
+                if (r1 == raw1)
+                {
+                    if (db1Count < DEBOUNCE_MS)
+                    {
+                        db1Count = db1Count + 1;
+                    }
+                }
+                else
+                {
+                    raw1 = r1;
+                    db1Count = 0;
+                }
+                if (db1Count == DEBOUNCE_MS)
+                {
+                    stable1 = raw1;
+                }
+
+                if (r2 == raw2)
+                {
+                    if (db2Count < DEBOUNCE_MS)
+                    {
+                        db2Count = db2Count + 1;
+                    }
+                }
+                else
+                {
+                    raw2 = r2;
+                    db2Count = 0;
+                }
+                if (db2Count == DEBOUNCE_MS)
+                {
+                    stable2 = raw2;
+                }
+
+                s1now = stable1;
+                s2now = stable2;
+
+                if (s1now == 0 && s2now == 0 && (sw1 != 0 || sw2 != 0))
+                {
+                    paused = 0;
+                }
+                sw1 = s1now;
+                sw2 = s2now;
+                ShowDigit(colorIndex, rateIndex, paused);
+                for (j = 0; j < TICK; j++);
+            }
+
+            GPIO_PORTF_DATA_R = colors[colorIndex];
+            ShowDigit(colorIndex, rateIndex, paused);
+            for (j = 0; j < TICK; j++);
+        }
+
+        /* ================= LED OFF HALF ================= */
+        GPIO_PORTF_DATA_R = 0x00;
+        delayLimit = rates[rateIndex];
+        for (i = 0; i < delayLimit; i++)
+        {
+            r1 = GPIO_PORTF_DATA_R & 0x10;
+            r2 = GPIO_PORTF_DATA_R & 0x01;
+
+            if (r1 == raw1)
+            {
+                if (db1Count < DEBOUNCE_MS)
+                {
+                    db1Count = db1Count + 1;
+                }
+            }
+            else
+            {
+                raw1 = r1;
+                db1Count = 0;
+            }
+            if (db1Count == DEBOUNCE_MS)
+            {
+                stable1 = raw1;
+            }
+
+            if (r2 == raw2)
+            {
+                if (db2Count < DEBOUNCE_MS)
+                {
+                    db2Count = db2Count + 1;
+                }
+            }
+            else
+            {
+                raw2 = r2;
+                db2Count = 0;
+            }
+            if (db2Count == DEBOUNCE_MS)
+            {
+                stable2 = raw2;
+            }
+
+            s1now = stable1;
+            s2now = stable2;
+
+            if (s1now == 0 && s2now == 0 && (sw1 != 0 || sw2 != 0))
+            {
+                waiting = 0;
+                if (paused == 0)
+                {
+                    paused = 1;
+                }
+                else
+                {
+                    paused = 0;
+                }
+            }
+            else if (s1now == 0 && sw1 != 0 && paused == 0)
+            {
+                waiting = 1;
+                waitCount = 0;
+            }
+            else if (s2now == 0 && sw2 != 0 && paused == 0)
+            {
+                waiting = 2;
+                waitCount = 0;
+            }
+
+            if (waiting != 0)
+            {
+                waitCount = waitCount + 1;
+                if (waitCount == WAIT_MS)
+                {
+                    if (waiting == 1)
+                    {
+                        rateIndex = rateIndex + 1;
+                        if (rateIndex == 8)
+                        {
+                            rateIndex = 0;
+                        }
+                    }
+                    else
+                    {
+                        colorIndex = colorIndex + 1;
+                        if (colorIndex == 8)
+                        {
+                            colorIndex = 0;
+                        }
+                    }
+                    waiting = 0;
+                }
+            }
+
+            sw1 = s1now;
+            sw2 = s2now;
+
+            while (paused == 1)
+            {
+                r1 = GPIO_PORTF_DATA_R & 0x10;
+                r2 = GPIO_PORTF_DATA_R & 0x01;
+
+                if (r1 == raw1)
+                {
+                    if (db1Count < DEBOUNCE_MS)
+                    {
+                        db1Count = db1Count + 1;
+                    }
+                }
+                else
+                {
+                    raw1 = r1;
+                    db1Count = 0;
+                }
+                if (db1Count == DEBOUNCE_MS)
+                {
+                    stable1 = raw1;
+                }
+
+                if (r2 == raw2)
+                {
+                    if (db2Count < DEBOUNCE_MS)
+                    {
+                        db2Count = db2Count + 1;
+                    }
+                }
+                else
+                {
+                    raw2 = r2;
+                    db2Count = 0;
+                }
+                if (db2Count == DEBOUNCE_MS)
+                {
+                    stable2 = raw2;
+                }
+
+                s1now = stable1;
+                s2now = stable2;
+
+                if (s1now == 0 && s2now == 0 && (sw1 != 0 || sw2 != 0))
+                {
+                    paused = 0;
+                }
+                sw1 = s1now;
+                sw2 = s2now;
+                ShowDigit(colorIndex, rateIndex, paused);
+                for (j = 0; j < TICK; j++);
+            }
+
+            ShowDigit(colorIndex, rateIndex, paused);
+            for (j = 0; j < TICK; j++);
+        }
+    }
+}
