@@ -35,7 +35,7 @@
 #define TICK    3180      /* inner loop count that gives about 1 ms */
 #define WAIT_MS 50        /* how long to wait for the second switch */
 
-int colourDigits[8] = {SEG_1, SEG_2, SEG_3, SEG_4, SEG_5, SEG_6, SEG_7, SEG_8};
+int colourDigits[8] = {SEG_0, SEG_1, SEG_2, SEG_3, SEG_4, SEG_5, SEG_6, SEG_7};
 int rateDigits[8]   = {SEG_1, SEG_2, SEG_3, SEG_4, SEG_5, SEG_6, SEG_7, SEG_8};
 
 void ShowDigit(int colorIndex, int rateIndex, int paused)
@@ -81,7 +81,7 @@ void ShowDigit(int colorIndex, int rateIndex, int paused)
 
 int main(void)
 {
-    int colors[8] = {0x02, 0x08, 0x04, 0x0E, 0x06, 0x0A, 0x0C, 0x00};
+    int colors[8] = {0x00, 0x02, 0x08, 0x04, 0x0E, 0x06, 0x0A, 0x0C};
     int rates[8]  = {2500, 2000, 1500, 1250, 1000, 500, 250, 100};
     int colorIndex = 0;
     int rateIndex = 0;
@@ -254,6 +254,7 @@ int main(void)
 
             while (paused == 1)
             {
+                GPIO_PORTF_DATA_R = colors[colorIndex];   /* hold the colour while frozen */
                 s1now = GPIO_PORTF_DATA_R & 0x10;
                 s2now = GPIO_PORTF_DATA_R & 0x01;
                 if (s1now == 0 && s2now == 0 && (sw1 != 0 || sw2 != 0))
@@ -265,6 +266,7 @@ int main(void)
                 ShowDigit(colorIndex, rateIndex, paused);
                 for (j = 0; j < TICK; j++);
             }
+            GPIO_PORTF_DATA_R = 0x00;                     /* OFF half continues */
 
             ShowDigit(colorIndex, rateIndex, paused);
             for (j = 0; j < TICK; j++);
