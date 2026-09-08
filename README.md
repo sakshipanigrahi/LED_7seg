@@ -16,14 +16,14 @@ The rules are simple, just like a game:
 | Press **SW1** alone (while running) | The LED **blinks faster or slower** (there are 8 speed levels) |
 | Press **SW2** alone (while running) | The LED **changes colour** (there are 8 colours, and one of them is "off") |
 | Press **SW1 AND SW2 at the same time** | The LED **freezes** (pauses) — it stops blinking and just holds its colour |
-| Press **both again** while paused | It **starts running again** |
+| Press **both again** while paused | It **starts running again**, picking the blink cycle back up where it left off |
 
 The display always shows the current "state" of the machine, like a status label:
 
 - Module 1 (leftmost digit) → `r` (running) or `P` (paused)
-- Module 2 → current colour number (0–7)
+- Module 2 → current colour number, shown as **0–7**
 - Module 3 → the letter `S` (just a label, short for "Speed")
-- Module 4 (rightmost) → current speed number (0–7)
+- Module 4 (rightmost) → current speed number, shown as **1–8** (note: this one starts counting at 1, not 0 — the colour digit and the speed digit use different starting numbers even though both cycle through 8 values internally)
 
 ## 2. Hardware Map (which wire does what)
 
@@ -33,7 +33,7 @@ The display always shows the current "state" of the machine, like a status label
 | PF4 | SW1 button input |
 | PF0 | SW2 button input |
 | PB0–PB7 | Turn on/off the 7 segments (+ dot) of whichever digit is currently lit |
-| PA4–PA7 | Choose **which one** of the 4 digit modules is currently lit |
+| PA4–PA7 | Choose **which one** of the 4 digit modules is currently lit — PA7 = Module 1 (status), PA6 = Module 2 (colour), PA5 = Module 3 ('S'), PA4 = Module 4 (speed) |
 
 **Why only one digit is "chosen" at a time (PA4–PA7)?**
 Because all 4 digits share the same 8 segment wires (PB0–PB7). The trick — called **multiplexing** — is to light up only one digit at a time, but do it so fast (hundreds of times per second) that your eye can't tell they aren't all lit together. It's the same idea as a flip-book: one picture at a time, shown quickly, looks like smooth motion.
@@ -73,9 +73,11 @@ Because a button is **read-only-active-low** here (0 = pressed, 1 = not pressed,
    - Wait again (the "off" half of the blink).
    - Repeat.
 
+Both the "on" half and the "off" half run the *same* button-checking and display-refresh logic each millisecond — the only difference between them is what the LED is doing at the start (lit vs dark) and, since the fix in §5.4, what happens if you pause partway through.
+
 ## 5. Problems Faced and How They Were Solved
 
-### 5.1 The "Both Buttons Pressed" Timing Problem (the hardest one)
+### 5.1 The "Both Buttons Pressed" Timing Problem
 
 **The problem:**
 Human fingers are not perfect. If you try to press SW1 and SW2 "at the same time," they are almost never pressed on the *exact same* 1-millisecond check. One will land a few milliseconds before the other.
@@ -123,7 +125,7 @@ The blink speed table (`rates[]`) stores how many "ticks" to wait for each speed
 Early on, the length of one pass through the loop (the "tick") changed — for example, moving from a display-refresh-only loop to one that also polled switches every pass changed how long each iteration actually took in real time. When that happened, **every blink speed silently got faster or slower**, even though the `rates[]` numbers themselves hadn't changed — because the *meaning* of "1 tick" had changed underneath them.
 
 **The fix:**
-Whenever the timing of the inner loop changes, the `rates[]` values must be **rescaled to match**. In the final version, the inner "on"/"off" wait loop is calibrated so that **each pass of the outer counting loop (`i`) is about 1 ms**, via the `TICK = 3180` inner constant. The `rates[]` array was then written directly in milliseconds (e.g. `2500, 2000, 1500 … 100`), so speed level 1 blinks roughly every 2.5 seconds and speed level 8 blinks roughly every 0.1 seconds.
+Whenever the timing of the inner loop changes, the `rates[]` values must be **rescaled to match**. In the final version, the inner "on"/"off" wait loop is calibrated so that **each pass of the outer counting loop (`i`) is about 1 ms**, via the `TICK = 3180` inner constant. The `rates[]` array was then written directly in milliseconds (`2500, 2000, 1500, 1250, 1000, 500, 250, 100`), so speed level 1 blinks roughly every 2.5 seconds and speed level 8 blinks roughly every 0.1 seconds.
 
 **Lesson:** any time the "cost" of one loop pass changes, every table of counts based on that loop (like `rates[]`) must be re-derived — otherwise the numbers stay the same but the real-world timing quietly drifts.
 
@@ -140,10 +142,33 @@ Using a separate plain `if` for every condition meant more than one branch could
 **c) Keeping the display flicker-free**
 `ShowDigit()` only lights **one** of the 4 digit modules per call, and advances an internal `turn` counter (0→1→2→3→0…) so the next call lights the next module. This counter increment had to be placed **once, at the very end of the function, outside every `if` branch** — otherwise it was possible for a digit to be skipped or repeated, causing visible flicker or a "stuck" digit.
 
+### 5.4 The "Pause Blackout" Problem — freezing during the OFF half
+
+**The problem:**
+The blink cycle spends half its time with the LED lit (the "ON half") and half its time with the LED dark (the "OFF half"). If pause was triggered while the code happened to be inside the **OFF half**, the freeze would simply hold whatever the LED was doing at that instant — which meant the LED froze **dark**. Visually this looked identical to "the board crashed" or "nothing is happening," with no way to tell paused-and-dark apart from broken-and-dark.
+
+Pausing during the ON half never had this issue, because the LED was already lit with its colour at that point — freezing there just kept the colour showing.
+
+**The fix:**
+Inside the OFF half's pause loop specifically, the code now force-sets the LED colour on every iteration while frozen:
+
+```c
+while (paused == 1)
+{
+    GPIO_PORTF_DATA_R = colors[colorIndex];   /* hold the colour while frozen */
+    ...
+}
+GPIO_PORTF_DATA_R = 0x00;                     /* OFF half continues */
+```
+
+So no matter which half of the blink the pause lands in, "paused" always looks the same on the LED: **lit, showing the current colour, not blinking.** The moment you un-pause, if the pause happened during the OFF half, the LED is explicitly snapped back to dark (`0x00`) so the interrupted OFF period continues as if nothing happened — the blink rhythm isn't shifted by having paused.
+
+Analogy: it's like a video player that always pauses on a visible frame instead of sometimes freezing on a black frame between scenes — and resumes exactly where the film left off, dark bits included.
+
 ## 6. Final Design Summary
 
 - **State variables:** `colorIndex` (0–7), `rateIndex` (0–7), `paused` (0/1).
 - **Simultaneous-press detection:** handled via the `waiting` / `waitCount` "wait-and-see" mechanism (§5.1).
 - **Blink timing:** controlled by `rates[]` (in milliseconds) combined with the `TICK = 3180` constant that represents ~1 ms at `-O0` (§5.2).
 - **Display refresh:** `ShowDigit()` is called once per millisecond tick inside the delay loop, cycling through all 4 modules roughly every 4 ms (~250 Hz refresh) so the whole display appears steady and flicker-free.
-- **Pause behaviour:** while paused, a dedicated inner `while (paused == 1)` loop keeps refreshing the display and watching only for the "both pressed again" gesture to resume — single-button presses are structurally ignored while paused.
+- **Pause behaviour:** while paused, a dedicated inner `while (paused == 1)` loop keeps refreshing the display and watching only for the "both pressed again" gesture to resume — single-button presses are structurally ignored while paused. The LED is always forced to show its colour while frozen, even if the pause landed during the OFF half of the blink cycle (§5.4); on resume, the OFF half is explicitly restored before the blink continues.
