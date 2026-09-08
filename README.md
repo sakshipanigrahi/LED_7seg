@@ -14,8 +14,8 @@ The rules are simple, just like a game:
 | If you... | Then... |
 |---|---|
 | Press **SW1** alone (while running) | The LED **blinks faster or slower** (there are 8 speed levels) |
-| Press **SW2** alone (while running) | The LED **changes colour** (there are 8 colours, and one of them is "off") |
-| Press **SW1 AND SW2 at the same time** | The LED **freezes** (pauses) — it stops blinking and just holds its colour |
+| Press **SW2** alone (while running) | The LED **changes colour** (there are 8 colours, and one of them is "off" — colour index 0 turns the LED fully dark, but the display still shows the digit `0` for it, not a blank digit) |
+| Press **SW1 AND SW2 at the same time** | The LED **freezes** (pauses) — it stops blinking and **stays switched on**, holding its current colour steady instead of going dark |
 | Press **both again** while paused | It **starts running again**, picking the blink cycle back up where it left off |
 
 The display always shows the current "state" of the machine, like a status label:
